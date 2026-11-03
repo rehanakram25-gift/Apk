@@ -1,0 +1,1445 @@
+ALL FILES FOR THE BP CHECKER ANDROID APP
+Create each file in your GitHub repository with exactly this path, then paste everything between the markers.
+
+======================================================================
+FILE: .github/workflows/build.yml
+======================================================================
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BPChecker-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+======================================================================
+FILE: settings.gradle.kts
+======================================================================
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "BPChecker"
+include(":app")
+
+======================================================================
+FILE: build.gradle.kts
+======================================================================
+plugins {
+    id("com.android.application") version "8.2.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+}
+
+======================================================================
+FILE: gradle.properties
+======================================================================
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=false
+android.nonTransitiveRClass=true
+kotlin.code.style=official
+
+======================================================================
+FILE: app/build.gradle.kts
+======================================================================
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.example.bpchecker"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.example.bpchecker"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+======================================================================
+FILE: app/src/main/AndroidManifest.xml
+======================================================================
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="BP Checker"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".OverlayService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+    </application>
+</manifest>
+
+======================================================================
+FILE: app/src/main/java/com/example/bpchecker/Analyzer.kt
+======================================================================
+package com.example.bpchecker
+
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+class Candle(var k: Int, var x0: Int, var x1: Int, var top: Int, var bot: Int, var btop: Double, var bbot: Double) {
+    var color: String = ""
+    val w: Int get() = x1 - x0 + 1
+}
+
+/** Candle as price-like numbers (higher = up). */
+class CV(val color: String, val o: Double, val c: Double, val h: Double, val l: Double) {
+    val body: Double get() = abs(c - o)
+}
+
+class Level(var v: Double, var n: Int) {
+    var role: String = "S"
+    var d: Double = 0.0
+    var sel: Boolean = false
+}
+
+class Match(val id: Int, val dir: String)
+
+class Res(
+    val ok: Boolean,
+    val all: List<CV>,
+    val closed: List<CV>,
+    val matches: List<Match>,
+    val trend: String,
+    val snrNear: Boolean,
+    val levels: List<Level>,
+    val count: Int
+)
+
+object Analyzer {
+
+    val NAMES: Map<Int, String> = mapOf(
+        1 to "Buy - SNR reject then break",
+        2 to "Sell - SNR reject then break",
+        3 to "Buy - 4 reds (1+2+3 = 4)",
+        4 to "Sell - 4 greens (1+2+3 = 4)",
+        5 to "Buy - doji at SNR in down move",
+        6 to "Sell - doji at SNR in up move",
+        9 to "Buy - 2 greens engulfed by red",
+        10 to "Sell - 2 reds engulfed by green",
+        13 to "Buy - break SNR, red retest holds",
+        14 to "Sell - break SNR, green retest holds",
+        17 to "Buy - 3 shrinking reds + green engulf",
+        18 to "Sell - 3 shrinking greens + red engulf",
+        21 to "Buy - red pokes below green low, closes in body",
+        22 to "Sell - green pokes above red high, closes in body",
+        23 to "Buy - 3 greens + red = their sum",
+        24 to "Sell - 3 reds + green = their sum",
+        27 to "Buy - big green, 3 small reds, big green",
+        28 to "Sell - big red, 3 small greens, big red",
+        29 to "Buy - R-G-R, close = first open",
+        30 to "Sell - G-R-G, close = first open"
+    )
+
+    /** 0 = nothing, 1 = green, 2 = red / orange-red. */
+    fun classify(p: Int): Int {
+        val r = (p shr 16) and 255
+        val g = (p shr 8) and 255
+        val b = p and 255
+        val mx = max(r, max(g, b))
+        val mn = min(r, min(g, b))
+        val d = mx - mn
+        if (mx < 90 || d.toDouble() / mx < 0.45) return 0
+        var h: Double
+        if (mx == r) h = ((g - b).toDouble() / d) % 6.0
+        else if (mx == g) h = (b - r).toDouble() / d + 2.0
+        else h = (r - g).toDouble() / d + 4.0
+        h *= 60.0
+        if (h < 0) h += 360.0
+        if (h >= 85.0 && h <= 170.0) return 1
+        if (h <= 40.0 || h >= 340.0) return 2
+        return 0
+    }
+
+    private fun ovl(top: Array<IntArray>, bot: Array<IntArray>, a: Int, x: Int, ref: Int): Int {
+        return min(bot[a][x], bot[a][ref]) - max(top[a][x], top[a][ref]) + 1
+    }
+
+    private fun tmed(a: List<Double>): Double {
+        val s = a.sorted()
+        val m = s.size / 2
+        return if (s.size % 2 == 1) s[m] else (s[m - 1] + s[m]) / 2.0
+    }
+
+    private fun mid(c: Candle): Double = (c.top + c.bot) / 2.0
+
+    /** Reads candles from a cropped, masked pixel array (RGB ints). */
+    fun detect(pix: IntArray, W: Int, H: Int): List<Candle> {
+        val cl = ByteArray(W * H)
+        for (p in 0 until W * H) cl[p] = classify(pix[p]).toByte()
+
+        val cnt = Array(2) { IntArray(W) }
+        val top = Array(2) { IntArray(W) { H } }
+        val bot = Array(2) { IntArray(W) { -1 } }
+        // per column: longest vertical run of candle colour
+        for (x in 0 until W) {
+            for (a in 0..1) {
+                val want = (a + 1).toByte()
+                var bs = -1
+                var be = -1
+                var cs = -1
+                var ce = -1
+                for (y in 0 until H) {
+                    if (cl[y * W + x] == want) {
+                        if (cs < 0 || y - ce > 3) cs = y
+                        ce = y
+                        if (bs < 0 || ce - cs > be - bs) {
+                            bs = cs
+                            be = ce
+                        }
+                    }
+                }
+                if (bs >= 0) {
+                    cnt[a][x] = be - bs + 1
+                    top[a][x] = bs
+                    bot[a][x] = be
+                }
+            }
+        }
+        val colK = IntArray(W)
+        for (x in 0 until W) {
+            if (cnt[0][x] >= 1 && cnt[0][x] >= cnt[1][x]) colK[x] = 1
+            else if (cnt[1][x] >= 1) colK[x] = 2
+        }
+        // group neighbouring columns of the same colour into candles
+        val runs = ArrayList<IntArray>()
+        var cur: IntArray? = null
+        for (x in 0 until W) {
+            val k = colK[x]
+            if (k == 0) continue
+            val c = cur
+            if (c != null && c[0] == k && x - c[2] <= 2) {
+                c[2] = x
+            } else {
+                if (c != null) runs.add(c)
+                cur = intArrayOf(k, x, x)
+            }
+        }
+        val lastRun = cur
+        if (lastRun != null) runs.add(lastRun)
+
+        var cands = ArrayList<Candle>()
+        for (r0 in runs) {
+            if (r0[2] - r0[1] + 1 < 3) continue
+            val a = r0[0] - 1
+            var ref = r0[1]
+            for (x in r0[1]..r0[2]) {
+                if (bot[a][x] - top[a][x] > bot[a][ref] - top[a][ref]) ref = x
+            }
+            var s0 = ref
+            var e0 = ref
+            // trim neighbouring objects (text, labels) lying in a different vertical band
+            while (s0 > r0[1] && ovl(top, bot, a, s0 - 1, ref) >= 0.3 * (bot[a][s0 - 1] - top[a][s0 - 1] + 1)) s0--
+            while (e0 < r0[2] && ovl(top, bot, a, e0 + 1, ref) >= 0.3 * (bot[a][e0 + 1] - top[a][e0 + 1] + 1)) e0++
+            val w = e0 - s0 + 1
+            if (w < 3) continue
+            var t = H
+            var b = -1
+            for (x in s0..e0) {
+                if (top[a][x] < t) t = top[a][x]
+                if (bot[a][x] > b) b = bot[a][x]
+            }
+            val edge = max(1, w / 4)
+            val xs = ArrayList<Int>()
+            for (i in 0 until edge) {
+                xs.add(s0 + i)
+                xs.add(e0 - i)
+            }
+            var bt = 0.0
+            var bb = 0.0
+            for (x in xs) {
+                bt += top[a][x]
+                bb += bot[a][x]
+            }
+            bt /= xs.size
+            bb /= xs.size
+            cands.add(Candle(r0[0], s0, e0, t, b, bt, bb))
+        }
+        if (cands.isNotEmpty()) {
+            val ws = cands.map { it.w }.sorted()
+            val med = ws[ws.size / 2]
+            cands = ArrayList(cands.filter { it.w <= med * 2.5 })
+        }
+        cands = ArrayList(clean(cands))
+        if (cands.isEmpty()) return cands
+
+        val tail = cands.takeLast(20).map { it.bbot - it.btop + 1 }.sorted()
+        val medBody = tail[tail.size / 2]
+        for (c in cands) {
+            val bh = c.bbot - c.btop + 1
+            c.color = if (bh <= max(2.5, 0.15 * medBody)) "doji" else if (c.k == 1) "green" else "red"
+        }
+        return cands
+    }
+
+    /** Keeps only the real candle row (drops tall bars, text blobs, strays). */
+    private fun clean(c0: List<Candle>): List<Candle> {
+        var c = ArrayList(c0)
+        if (c.size < 6) return c
+        val medH = tmed(c.map { (it.bot - it.top + 1).toDouble() })
+        c = ArrayList(c.filter {
+            val h = (it.bot - it.top + 1).toDouble()
+            h <= max(3.2 * medH, 12.0) && h >= max(4.0, 0.1 * medH)
+        })
+        if (c.size < 6) return c
+        val mh = tmed(c.map { (it.bot - it.top + 1).toDouble() })
+        var guard = 0
+        while (guard < 40 && c.size >= 6) {
+            var worst = -1
+            var wd = 0.0
+            for (i in c.indices) {
+                val nb = ArrayList<Double>()
+                for (j in (i - 2)..(i + 2)) {
+                    if (j != i && j >= 0 && j < c.size) nb.add(mid(c[j]))
+                }
+                val dev = abs(mid(c[i]) - tmed(nb))
+                if (dev > wd) {
+                    wd = dev
+                    worst = i
+                }
+            }
+            if (worst < 0 || wd <= max(2.5 * mh, 20.0)) break
+            c.removeAt(worst)
+            guard++
+        }
+        if (c.size < 4) return c
+        val cx = c.map { (it.x0 + it.x1) / 2.0 }
+        val gaps = ArrayList<Double>()
+        for (i in 1 until cx.size) gaps.add(cx[i] - cx[i - 1])
+        val sp = tmed(gaps)
+        val chains = ArrayList<ArrayList<Candle>>()
+        var cur = ArrayList<Candle>()
+        cur.add(c[0])
+        for (i in 1 until c.size) {
+            if (gaps[i - 1] > 3.5 * sp) {
+                chains.add(cur)
+                cur = ArrayList()
+            }
+            cur.add(c[i])
+        }
+        chains.add(cur)
+        var best = chains[0]
+        for (ch in chains) {
+            if (ch.size > best.size) best = ch
+        }
+        return best
+    }
+
+    /** base = screen height minus region top, so values stay comparable when the region changes. */
+    fun toValues(c: Candle, base: Int): CV {
+        val hi = (base - c.top).toDouble()
+        val lo = (base - c.bot).toDouble()
+        val bHi = base - c.btop
+        val bLo = base - c.bbot
+        val o: Double
+        val cl: Double
+        if (c.color == "green") {
+            o = bLo
+            cl = bHi
+        } else if (c.color == "red") {
+            o = bHi
+            cl = bLo
+        } else {
+            o = (bHi + bLo) / 2.0
+            cl = o
+        }
+        return CV(c.color, o, cl, hi, lo)
+    }
+
+    private fun rd(v: Double, c: CV): Double {
+        return if (v >= c.l && v <= c.h) 0.0 else min(abs(v - c.h), abs(v - c.l))
+    }
+
+    /** Returns (levels to draw/list, levels near the latest candles sorted by closeness). */
+    fun findLevels(cs: List<CV>, avg: Double): Pair<List<Level>, List<Level>> {
+        val n = cs.size
+        if (n < 7) return Pair(emptyList(), emptyList())
+        val win = cs.takeLast(60)
+        val m = win.size
+        val piv = ArrayList<Double>()
+        for (i in 2 until m - 2) {
+            var isH = true
+            var isL = true
+            for (j in (i - 2)..(i + 2)) {
+                if (win[j].h > win[i].h) isH = false
+                if (win[j].l < win[i].l) isL = false
+            }
+            if (isH) piv.add(win[i].h)
+            if (isL) piv.add(win[i].l)
+        }
+        piv.sort()
+        val tol = 0.9 * avg
+        val levels = ArrayList<Level>()
+        var grp = ArrayList<Double>()
+        fun flush() {
+            if (grp.size >= 2) levels.add(Level(grp.sum() / grp.size, grp.size))
+            grp = ArrayList()
+        }
+        for (v in piv) {
+            if (grp.isNotEmpty() && v - grp[grp.size - 1] > tol) flush()
+            grp.add(v)
+        }
+        flush()
+        val ref = cs[n - 1].c
+        val a = cs[n - 1]
+        val b = cs[n - 2]
+        for (lv in levels) {
+            lv.role = if (lv.v > ref) "R" else "S"
+            lv.d = min(rd(lv.v, a), rd(lv.v, b))
+        }
+        levels.sortWith(Comparator<Level> { p, q ->
+            if (p.n != q.n) q.n - p.n else abs(p.v - ref).compareTo(abs(q.v - ref))
+        })
+        val keep = ArrayList(levels.take(6))
+        val relevant = ArrayList(keep.filter { it.d <= 1.5 * avg }.sortedBy { it.d })
+        if (relevant.isNotEmpty()) relevant[0].sel = true
+        return Pair(keep, relevant)
+    }
+
+    private fun approx(a: Double, b: Double): Boolean = abs(a - b) <= 0.25 * max(max(a, b), 1.0)
+    private fun isG(c: CV) = c.color == "green"
+    private fun isR(c: CV) = c.color == "red"
+    private fun isD(c: CV) = c.color == "doji"
+
+    /** The 20 strategies that can be checked mechanically. [cs] ends with the latest candle. */
+    fun matchPatterns(cs: List<CV>, trend: String, snr: Double?, avg: Double): List<Match> {
+        val out = ArrayList<Match>()
+        val n = cs.size
+        if (n < 2) return out
+        val L = cs[n - 1]
+        val P = cs[n - 2]
+        val tol = 0.1 * avg
+
+        if (n >= 4) {
+            val a0 = cs[n - 4]
+            val a1 = cs[n - 3]
+            val a2 = cs[n - 2]
+            val a3 = cs[n - 1]
+            val sum3 = a0.body + a1.body + a2.body
+            if (isR(a0) && isR(a1) && isR(a2) && isR(a3) && approx(sum3, a3.body)) out.add(Match(3, "Up"))
+            if (isG(a0) && isG(a1) && isG(a2) && isG(a3) && approx(sum3, a3.body)) out.add(Match(4, "Down"))
+            val b0 = a0.body
+            val b1 = a1.body
+            val b2 = a2.body
+            if (a0.color == a1.color && a1.color == a2.color && b1 < b0 * 0.85 && b2 < b1 * 0.85) {
+                if (isR(a0) && isG(a3) && a3.c >= a2.o - tol && a3.o <= a2.c + tol) out.add(Match(17, "Up"))
+                if (isG(a0) && isR(a3) && a3.c <= a2.o + tol && a3.o >= a2.c - tol) out.add(Match(18, "Down"))
+            }
+            if (isG(a0) && isG(a1) && isG(a2) && isR(a3) && approx(sum3, a3.body)) out.add(Match(23, "Up"))
+            if (isR(a0) && isR(a1) && isR(a2) && isG(a3) && approx(sum3, a3.body)) out.add(Match(24, "Down"))
+        }
+        if (n >= 3) {
+            val x = cs[n - 3]
+            val y = cs[n - 2]
+            val z = cs[n - 1]
+            if (isG(x) && isG(y) && isR(z) && z.o >= y.c - tol && z.c <= x.o + tol) out.add(Match(9, "Up"))
+            if (isR(x) && isR(y) && isG(z) && z.o <= y.c + tol && z.c >= x.o - tol) out.add(Match(10, "Down"))
+            if (isR(x) && isG(y) && isR(z) && abs(z.c - x.o) <= 0.25 * avg) out.add(Match(29, "Up"))
+            if (isG(x) && isR(y) && isG(z) && abs(z.c - x.o) <= 0.25 * avg) out.add(Match(30, "Down"))
+        }
+        if (n >= 5) {
+            val big = cs[n - 5]
+            val mids = cs.subList(n - 4, n - 1)
+            val insideAll = mids.all { it.h <= big.h + tol && it.l >= big.l - tol && it.body <= 0.8 * avg }
+            if (isG(big) && big.body >= 1.2 * avg && insideAll && mids.all { isR(it) } && isG(L) && L.body >= 1.2 * avg && L.c > big.h) out.add(Match(27, "Up"))
+            if (isR(big) && big.body >= 1.2 * avg && insideAll && mids.all { isG(it) } && isR(L) && L.body >= 1.2 * avg && L.c < big.l) out.add(Match(28, "Down"))
+        }
+        if (isG(P) && isR(L) && L.l < P.l && L.c >= (P.o + P.c) / 2) out.add(Match(21, "Up"))
+        if (isR(P) && isG(L) && L.h > P.h && L.c <= (P.o + P.c) / 2) out.add(Match(22, "Down"))
+
+        if (snr != null) {
+            val s: Double = snr
+            if (isD(L) && trend == "Down" && L.l <= s && L.h >= s && L.c > s) out.add(Match(5, "Up"))
+            if (isD(L) && trend == "Up" && L.l <= s && L.h >= s && L.c < s) out.add(Match(6, "Down"))
+            if (trend == "Up" && isR(P) && P.h >= s && P.c < s && isG(L) && L.c > s) out.add(Match(1, "Up"))
+            if (trend == "Down" && isG(P) && P.l <= s && P.c > s && isR(L) && L.c < s) out.add(Match(2, "Down"))
+            if (trend == "Up" && isG(P) && P.o < s && P.c > s && isR(L) && L.l <= s && L.c > s) out.add(Match(13, "Up"))
+            if (trend == "Down" && isR(P) && P.o > s && P.c < s && isG(L) && L.h >= s && L.c < s) out.add(Match(14, "Down"))
+        }
+        return out
+    }
+}
+
+======================================================================
+FILE: app/src/main/java/com/example/bpchecker/Engine.kt
+======================================================================
+package com.example.bpchecker
+
+import android.content.SharedPreferences
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+class Frame(val pix: IntArray, val w: Int, val h: Int)
+
+class Pend(val id: Int, val dir: String, val openAt: Long, val last: CV, val time: String)
+
+/**
+ * Runs on a background thread: step() is called about 3 times a second.
+ * - finds the candle area by itself
+ * - reads candles, finds support/resistance, matches the strategies
+ * - learns the candle timeframe and exact candle-open moment from the chart
+ * - shows UP / DOWN a few seconds before the next candle opens
+ * - scores each signal on the following candle
+ */
+class Engine(
+    private val getFrame: () -> Frame?,
+    private val getMask: () -> IntArray?,
+    private val prefs: SharedPreferences,
+    private val onSignal: () -> Unit
+) {
+    @Volatile var countdown: String = "Next candle opens in --"
+    @Volatile var sigText: String = "WAITING"
+    @Volatile var sigKind: Int = 0          // 0 none, 1 up, 2 down
+    @Volatile var sub: String = "Open the Quotex chart. The signal appears a few seconds before each new candle."
+    @Volatile var live: String = ""
+    @Volatile var syncNote: String = "Waiting to sync: needs to see a candle open on the chart."
+    @Volatile var statsText: String = ""
+    @Volatile var tfSec: Int = 60
+    @Volatile var leadSec: Int = 3
+
+    private val STD = intArrayOf(5, 10, 15, 30, 60, 120, 180, 300, 600, 900)
+    private val LEADS = intArrayOf(2, 3, 4, 5)
+
+    private var region: IntArray? = null
+    private var lastFitTs = 0L
+    private var offsetMs = 0L
+    private var autoSync = true
+    private var sigCycle = -1L
+    private var prevAll: List<CV>? = null
+    private var prevScanTs = 0L
+    private val openEvents = ArrayList<Long>()
+    private val skews = ArrayList<Long>()
+    private val ivStd = ArrayList<Int>()
+    private var tfNote = ""
+    private val pendings = ArrayList<Pend>()
+    private val stats = HashMap<Int, IntArray>()   // id -> [wins, losses, ties]
+    private var lastRes: Res? = null
+    private val fmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+
+    init {
+        loadStats()
+        buildStatsText()
+    }
+
+    // ---------------------------------------------------------------- main loop
+    fun step() {
+        val now = System.currentTimeMillis()
+        val tf = tfSec * 1000L
+        val t = now - offsetMs
+        val cycle = Math.floorDiv(t, tf)
+        val remMs = tf - Math.floorMod(t, tf)
+        countdown = "Next candle opens in " + String.format(Locale.US, "%.1f", remMs / 1000.0) + " s"
+
+        val fr = getFrame()
+        if (fr == null) {
+            live = "Waiting for screen frames..."
+            return
+        }
+        val all = detectAll(fr)
+        track(all, now)
+        val res = analyze(all, true)
+        lastRes = res
+        val ms = res.matches.joinToString(" ") { it.id.toString() + (if (it.dir == "Up") "^" else "v") }
+        live = if (!res.ok) {
+            "Live: only " + res.count + " candle(s) found. Zoom the chart in and keep the panel off the candles."
+        } else {
+            "Live: " + res.count + " candles, trend " + res.trend.lowercase(Locale.US) + ", " + res.levels.size + " S/R, matching: " + (if (ms.isEmpty()) "none" else ms)
+        }
+
+        // 1) signal moment: a few seconds before the next candle opens
+        if (remMs <= leadSec * 1000L && cycle != sigCycle) {
+            sigCycle = cycle
+            makeSignal(res, now + remMs, now)
+        }
+        // 2) scoring moment: 1 s after the predicted candle has closed
+        val due = pendings.filter { now >= it.openAt + tf + 1000 }
+        if (due.isNotEmpty()) {
+            pendings.removeAll(due)
+            scoreDue(due, all)
+        }
+    }
+
+    // ---------------------------------------------------------------- reading the chart
+    private fun detectRegion(fr: Frame, rg: IntArray): List<Candle> {
+        val w = rg[2]
+        val h = rg[3]
+        val pix = IntArray(w * h)
+        for (y in 0 until h) {
+            System.arraycopy(fr.pix, (rg[1] + y) * fr.w + rg[0], pix, y * w, w)
+        }
+        val mask = getMask()
+        if (mask != null) {
+            val mx0 = max(mask[0], rg[0])
+            val my0 = max(mask[1], rg[1])
+            val mx1 = min(mask[2], rg[0] + w)
+            val my1 = min(mask[3], rg[1] + h)
+            if (mx0 < mx1 && my0 < my1) {
+                for (ay in my0 until my1) {
+                    for (ax in mx0 until mx1) pix[(ay - rg[1]) * w + (ax - rg[0])] = 0
+                }
+            }
+        }
+        return Analyzer.detect(pix, w, h)
+    }
+
+    private fun detectAll(fr: Frame): List<CV> {
+        var rg: IntArray = region ?: intArrayOf(0, 0, fr.w, fr.h)
+        var cands = detectRegion(fr, rg)
+        val nr = fitRegion(cands, rg, fr)
+        if (nr != null) {
+            region = nr
+            rg = nr
+            cands = detectRegion(fr, rg)
+        }
+        val base = fr.h - rg[1]
+        return cands.map { Analyzer.toValues(it, base) }
+    }
+
+    /** Finds the candle area automatically and re-fits it when candles reach its edge. */
+    private fun fitRegion(l: List<Candle>, base: IntArray, fr: Frame): IntArray? {
+        if (l.size < 8) return null
+        val now = System.currentTimeMillis()
+        if (region != null && now - lastFitTs < 4000) return null
+        val w = base[2]
+        val h = base[3]
+        var minTop = Int.MAX_VALUE
+        var maxBot = Int.MIN_VALUE
+        for (c in l) {
+            if (c.top < minTop) minTop = c.top
+            if (c.bot > maxBot) maxBot = c.bot
+        }
+        val gaps = ArrayList<Double>()
+        for (i in 1 until l.size) gaps.add((l[i].x0 + l[i].x1) / 2.0 - (l[i - 1].x0 + l[i - 1].x1) / 2.0)
+        gaps.sort()
+        val sp = max(6.0, gaps[gaps.size / 2])
+        val span = max(30, maxBot - minTop)
+        val need = region == null || minTop < 0.03 * h || maxBot > 0.97 * h || l[l.size - 1].x1 > w - 1.2 * sp || span < 0.3 * h
+        if (!need) return null
+        val padY = max(24.0, 0.25 * span)
+        val x0 = max(0.0, base[0] + l[0].x0 - 1.5 * sp)
+        val y0 = max(0.0, base[1] + minTop - padY)
+        val x1 = min(fr.w.toDouble(), base[0] + l[l.size - 1].x1 + 3.0 * sp)
+        val y1 = min(fr.h.toDouble(), base[1] + maxBot + padY)
+        if (x1 - x0 < 80 || y1 - y0 < 60) return null
+        lastFitTs = now
+        return intArrayOf(x0.toInt(), y0.toInt(), (x1 - x0).toInt(), (y1 - y0).toInt())
+    }
+
+    private fun analyze(all: List<CV>, includeForming: Boolean): Res {
+        val closed = if (includeForming) all else all.dropLast(1)
+        if (closed.size < 3) {
+            return Res(false, all, closed, emptyList(), "Flat", false, emptyList(), all.size)
+        }
+        val bodies = closed.takeLast(20).filter { it.color != "doji" }.map { it.body }.sorted()
+        val avg = if (bodies.isEmpty()) 5.0 else bodies[bodies.size / 2]
+        var trend = "Flat"
+        val w8 = closed.takeLast(8)
+        if (w8.size >= 6) {
+            val f = (w8[0].c + w8[1].c + w8[2].c) / 3.0
+            val l = (w8[w8.size - 1].c + w8[w8.size - 2].c + w8[w8.size - 3].c) / 3.0
+            trend = if (l - f > avg) "Up" else if (f - l > avg) "Down" else "Flat"
+        }
+        val lv = Analyzer.findLevels(closed, avg)
+        val rel = lv.second
+        val snrList: List<Double?> = if (rel.isEmpty()) listOf<Double?>(null) else rel.map { it.v }
+        val seen = HashSet<Int>()
+        val matches = ArrayList<Match>()
+        for (sv in snrList) {
+            for (m in Analyzer.matchPatterns(closed, trend, sv, avg)) {
+                if (seen.add(m.id)) matches.add(m)
+            }
+        }
+        return Res(true, all, closed, matches, trend, rel.isNotEmpty(), lv.first, all.size)
+    }
+
+    // ---------------------------------------------------------------- reading candle openings from the chart
+    private fun track(all: List<CV>, now: Long) {
+        if (all.size < 6) return
+        val cur = all.takeLast(5)
+        val pa = prevAll
+        if (pa != null && now - prevScanTs < 3000) {
+            var st = 0
+            var sh = 0
+            for (j in 0..3) {
+                if (abs(cur[4 - j].o - pa[4 - j].o) <= 3) st++
+                if (abs(cur[3 - j].o - pa[4 - j].o) <= 3) sh++
+            }
+            if (sh >= 3 && sh > st) onNewCandle(now - (now - prevScanTs) / 2)
+        }
+        prevAll = cur
+        prevScanTs = now
+    }
+
+    private fun onNewCandle(t: Long) {
+        val last: Long? = if (openEvents.isEmpty()) null else openEvents[openEvents.size - 1]
+        if (last != null && t - last < 2000) return
+        openEvents.add(t)
+        if (openEvents.size > 10) openEvents.removeAt(0)
+        if (!autoSync) return
+        if (last != null) {
+            val iv = (t - last) / 1000.0
+            var std = 0
+            for (s in STD) {
+                if (abs(iv - s) <= max(1.5, 0.04 * s)) {
+                    std = s
+                    break
+                }
+            }
+            ivStd.add(std)
+            if (ivStd.size > 3) ivStd.removeAt(0)
+            val n = ivStd.size
+            if (n >= 2 && ivStd[n - 1] != 0 && ivStd[n - 1] == ivStd[n - 2] && ivStd[n - 1] != tfSec) {
+                tfSec = ivStd[n - 1]
+                skews.clear()
+                sigCycle = -1L
+                pendings.clear()
+                tfNote = "Timeframe read from chart: " + tfSec + " s. "
+            }
+        }
+        val tf = tfSec * 1000L
+        val x = Math.floorMod(t, tf)
+        val sk = if (x > tf / 2) x - tf else x
+        skews.add(sk)
+        if (skews.size > 5) skews.removeAt(0)
+        val s = skews.sorted()
+        offsetMs = s[s.size / 2]
+        syncNote = tfNote + "Auto-synced to the chart (" + skews.size + " candle open(s) seen, offset " + String.format(Locale.US, "%.1f", offsetMs / 1000.0) + " s)."
+    }
+
+    // ---------------------------------------------------------------- signals and scoring
+    private fun makeSignal(res: Res, openAt: Long, now: Long) {
+        if (!res.ok) {
+            sigKind = 0
+            sigText = "CHART NOT READABLE"
+            sub = "Keep the Quotex chart visible and zoomed in so candles are wide."
+            return
+        }
+        val last = res.closed[res.closed.size - 1]
+        val ups = res.matches.filter { it.dir == "Up" }
+        val downs = res.matches.filter { it.dir == "Down" }
+        val openStr = fmt.format(Date(openAt))
+        val ids = res.matches.joinToString(", ") { it.id.toString() }
+        if (res.matches.isEmpty()) {
+            sigKind = 0
+            sigText = "NO SIGNAL"
+            sub = "No pattern matched before the candle opening at " + openStr + "."
+        } else if (ups.isNotEmpty() && downs.isNotEmpty()) {
+            sigKind = 0
+            sigText = "CONFLICT - SKIP"
+            sub = "Patterns " + ids + " disagree. Candle at " + openStr + "."
+        } else {
+            val up = ups.isNotEmpty()
+            sigKind = if (up) 1 else 2
+            sigText = if (up) "UP" else "DOWN"
+            sub = "For the candle opening at " + openStr + ". Pattern " + ids + ". Read from the still-forming candle, so a last-second move can change it."
+            onSignal()
+        }
+        val ts = fmt.format(Date(now))
+        for (m in res.matches) pendings.add(Pend(m.id, m.dir, openAt, last, ts))
+    }
+
+    private fun scoreDue(due: List<Pend>, all: List<CV>) {
+        val closed = all.dropLast(1)           // the right-most candle is the new, still forming one
+        if (closed.size < 2) return
+        val p = closed[closed.size - 1]
+        val s = closed[closed.size - 2]
+        for (d in due) {
+            if (abs(s.o - d.last.o) > 4) continue      // chart alignment lost, do not score
+            val st = stats.getOrPut(d.id) { IntArray(3) }
+            if (p.color == "doji") st[2]++
+            else if ((d.dir == "Up" && p.color == "green") || (d.dir == "Down" && p.color == "red")) st[0]++
+            else st[1]++
+        }
+        saveStats()
+        buildStatsText()
+    }
+
+    // ---------------------------------------------------------------- buttons
+    fun analyzeNow() {
+        val r = lastRes
+        if (r == null || !r.ok) {
+            sub = "Not enough candles yet. Zoom the chart in and keep the panel off the candles."
+            return
+        }
+        val rs = r.levels.joinToString(", ") { it.role + " x" + it.n }
+        val ms = if (r.matches.isEmpty()) "none" else r.matches.joinToString("; ") { (Analyzer.NAMES[it.id] ?: "") + " [" + it.id + "] -> " + it.dir }
+        sub = r.count.toString() + " candles, trend " + r.trend.lowercase(Locale.US) + ". Levels: " + (if (rs.isEmpty()) "none" else rs) + ". Matches: " + ms
+    }
+
+    fun syncNow() {
+        val tf = tfSec * 1000L
+        val x = Math.floorMod(System.currentTimeMillis(), tf)
+        offsetMs = if (x > tf / 2) x - tf else x
+        autoSync = false
+        sigCycle = -1L
+        syncNote = "Manual sync applied (auto-sync is off)."
+    }
+
+    fun cycleTf() {
+        var i = 0
+        for (k in STD.indices) if (STD[k] == tfSec) i = k
+        tfSec = STD[(i + 1) % STD.size]
+        skews.clear()
+        ivStd.clear()
+        sigCycle = -1L
+        pendings.clear()
+    }
+
+    fun cycleLead() {
+        var i = 0
+        for (k in LEADS.indices) if (LEADS[k] == leadSec) i = k
+        leadSec = LEADS[(i + 1) % LEADS.size]
+    }
+
+    fun resetStats() {
+        stats.clear()
+        saveStats()
+        buildStatsText()
+    }
+
+    // ---------------------------------------------------------------- score storage
+    private fun loadStats() {
+        val s = prefs.getString("stats", "") ?: ""
+        if (s.isEmpty()) return
+        for (part in s.split(";")) {
+            val f = part.split(":")
+            if (f.size == 4) {
+                val id = f[0].toIntOrNull() ?: continue
+                stats[id] = intArrayOf(f[1].toIntOrNull() ?: 0, f[2].toIntOrNull() ?: 0, f[3].toIntOrNull() ?: 0)
+            }
+        }
+    }
+
+    private fun saveStats() {
+        val sb = StringBuilder()
+        for ((id, v) in stats) {
+            if (sb.isNotEmpty()) sb.append(";")
+            sb.append(id).append(":").append(v[0]).append(":").append(v[1]).append(":").append(v[2])
+        }
+        prefs.edit().putString("stats", sb.toString()).apply()
+    }
+
+    private fun buildStatsText() {
+        val ids = stats.keys.sorted()
+        if (ids.isEmpty()) {
+            statsText = "No scored signals yet. A signal is a win if the next candle closes in its direction (doji = tie). Break-even at 85% payout is about 54%."
+            return
+        }
+        var tw = 0
+        var tl = 0
+        for (id in ids) {
+            val v = stats[id]
+            if (v != null) {
+                tw += v[0]
+                tl += v[1]
+            }
+        }
+        val sb = StringBuilder()
+        sb.append("Break-even at 85% payout: 54%. Overall ").append(tw).append("W / ").append(tl).append("L")
+        if (tw + tl > 0) sb.append(" (").append(100 * tw / (tw + tl)).append("%)")
+        sb.append("\n")
+        for (id in ids) {
+            val v = stats[id] ?: continue
+            val n = v[0] + v[1]
+            sb.append("#").append(id).append("  ").append(v[0]).append("W ").append(v[1]).append("L")
+            if (n > 0) sb.append("  ").append(100 * v[0] / n).append("%")
+            sb.append(if (n >= 30) "" else "  (need 30+)").append("\n")
+        }
+        statsText = sb.toString()
+    }
+}
+
+======================================================================
+FILE: app/src/main/java/com/example/bpchecker/OverlayService.kt
+======================================================================
+package com.example.bpchecker
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.AudioManager
+import android.media.ImageReader
+import android.media.ToneGenerator
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.util.DisplayMetrics
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+
+class OverlayService : Service() {
+
+    private var wm: WindowManager? = null
+    private var root: LinearLayout? = null
+    private var tvCd: TextView? = null
+    private var tvSig: TextView? = null
+    private var tvSub: TextView? = null
+    private var tvLive: TextView? = null
+    private var tvStats: TextView? = null
+    private var btnTf: Button? = null
+    private var btnLead: Button? = null
+    private var body: LinearLayout? = null
+
+    private val ui = Handler(Looper.getMainLooper())
+    private var scanThread: HandlerThread? = null
+    private var scanHandler: Handler? = null
+    private var engine: Engine? = null
+
+    private var projection: MediaProjection? = null
+    private var vdisplay: VirtualDisplay? = null
+    private var reader: ImageReader? = null
+
+    @Volatile private var lastFrame: Frame? = null
+    @Volatile private var mask: IntArray? = null
+    private var statsOn = false
+    private var running = false
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (running) return START_NOT_STICKY
+        val code = intent.getIntExtra("code", 0)
+        val data = intent.getParcelableExtra<Intent>("data")
+        if (data == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        startAsForeground()
+        try {
+            startCapture(code, data)
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Could not start screen capture: " + e.message, Toast.LENGTH_LONG).show()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        buildOverlay()
+        startEngine()
+        running = true
+        return START_NOT_STICKY
+    }
+
+    private fun startAsForeground() {
+        val chId = "bpc_channel"
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(NotificationChannel(chId, "BP Checker", NotificationManager.IMPORTANCE_LOW))
+        val n: Notification = Notification.Builder(this, chId)
+            .setContentTitle("BP Checker is running")
+            .setContentText("Reading the shared screen (demo practice)")
+            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .build()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(1, n)
+        }
+    }
+
+    private fun startCapture(code: Int, data: Intent) {
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val mp = mpm.getMediaProjection(code, data)
+        projection = mp
+        mp.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                ui.post { stopSelf() }
+            }
+        }, ui)
+        val dm = DisplayMetrics()
+        val w = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        w.defaultDisplay.getRealMetrics(dm)
+        val rd = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, PixelFormat.RGBA_8888, 2)
+        reader = rd
+        vdisplay = mp.createVirtualDisplay(
+            "bpc", dm.widthPixels, dm.heightPixels, dm.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null
+        )
+    }
+
+    /** Latest screen picture as RGB ints (re-uses the previous one if the screen has not changed). */
+    private fun grab(): Frame? {
+        val rd = reader ?: return lastFrame
+        val img = rd.acquireLatestImage() ?: return lastFrame
+        try {
+            val w = img.width
+            val h = img.height
+            val plane = img.planes[0]
+            val buf = plane.buffer
+            val ps = plane.pixelStride
+            val rs = plane.rowStride
+            val bytes = ByteArray(buf.remaining())
+            buf.get(bytes)
+            val pix = IntArray(w * h)
+            for (y in 0 until h) {
+                var o = y * rs
+                val row = y * w
+                for (x in 0 until w) {
+                    if (o + 2 >= bytes.size) break
+                    pix[row + x] = ((bytes[o].toInt() and 255) shl 16) or ((bytes[o + 1].toInt() and 255) shl 8) or (bytes[o + 2].toInt() and 255)
+                    o += ps
+                }
+            }
+            val f = Frame(pix, w, h)
+            lastFrame = f
+            return f
+        } finally {
+            img.close()
+        }
+    }
+
+    private fun smallBtn(text: String): Button {
+        val b = Button(this)
+        b.text = text
+        b.textSize = 11f
+        b.isAllCaps = false
+        b.minWidth = 0
+        b.minHeight = 0
+        b.setPadding(dp(6), dp(4), dp(6), dp(4))
+        return b
+    }
+
+    private fun weighted(b: Button): Button {
+        b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        return b
+    }
+
+    private fun buildOverlay() {
+        val w = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        wm = w
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.VERTICAL
+        r.setBackgroundColor(Color.parseColor("#EE0F172A"))
+        r.setPadding(dp(8), dp(6), dp(8), dp(8))
+        root = r
+
+        // header (drag handle + minimise + close)
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        val title = TextView(this)
+        title.text = "BP Checker (drag here)"
+        title.setTextColor(Color.WHITE)
+        title.textSize = 13f
+        title.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        val bMin = smallBtn("-")
+        val bClose = smallBtn("X")
+        head.addView(title)
+        head.addView(bMin)
+        head.addView(bClose)
+        r.addView(head)
+
+        val bd = LinearLayout(this)
+        bd.orientation = LinearLayout.VERTICAL
+        body = bd
+
+        val cd = TextView(this)
+        cd.setTextColor(Color.parseColor("#94a3b8"))
+        cd.textSize = 12f
+        cd.gravity = Gravity.CENTER
+        cd.setPadding(0, dp(4), 0, 0)
+        tvCd = cd
+        bd.addView(cd)
+
+        val sg = TextView(this)
+        sg.textSize = 26f
+        sg.gravity = Gravity.CENTER
+        sg.setTypeface(sg.typeface, android.graphics.Typeface.BOLD)
+        sg.setPadding(0, dp(8), 0, dp(8))
+        tvSig = sg
+        bd.addView(sg)
+
+        val sb = TextView(this)
+        sb.setTextColor(Color.parseColor("#cbd5e1"))
+        sb.textSize = 11f
+        tvSub = sb
+        bd.addView(sb)
+
+        val lv = TextView(this)
+        lv.setTextColor(Color.parseColor("#64748b"))
+        lv.textSize = 10f
+        lv.setPadding(0, dp(4), 0, dp(4))
+        tvLive = lv
+        bd.addView(lv)
+
+        val row1 = LinearLayout(this)
+        row1.orientation = LinearLayout.HORIZONTAL
+        val bAnalyze = weighted(smallBtn("Analyze"))
+        val bSync = weighted(smallBtn("Sync"))
+        val bTf = weighted(smallBtn("TF 60s"))
+        btnTf = bTf
+        row1.addView(bAnalyze)
+        row1.addView(bSync)
+        row1.addView(bTf)
+        bd.addView(row1)
+
+        val row2 = LinearLayout(this)
+        row2.orientation = LinearLayout.HORIZONTAL
+        val bLead = weighted(smallBtn("Lead 3s"))
+        btnLead = bLead
+        val bStats = weighted(smallBtn("Scores"))
+        val bReset = weighted(smallBtn("Reset"))
+        row2.addView(bLead)
+        row2.addView(bStats)
+        row2.addView(bReset)
+        bd.addView(row2)
+
+        val st = TextView(this)
+        st.setTextColor(Color.parseColor("#e2e8f0"))
+        st.textSize = 11f
+        st.visibility = View.GONE
+        tvStats = st
+        bd.addView(st)
+
+        r.addView(bd)
+
+        val p = WindowManager.LayoutParams(
+            dp(280),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        )
+        p.gravity = Gravity.TOP or Gravity.START
+        p.x = dp(8)
+        p.y = dp(80)
+
+        var startX = 0
+        var startY = 0
+        var touchX = 0f
+        var touchY = 0f
+        head.setOnTouchListener { _, ev ->
+            if (ev.action == MotionEvent.ACTION_DOWN) {
+                startX = p.x
+                startY = p.y
+                touchX = ev.rawX
+                touchY = ev.rawY
+            } else if (ev.action == MotionEvent.ACTION_MOVE) {
+                p.x = startX + (ev.rawX - touchX).toInt()
+                p.y = startY + (ev.rawY - touchY).toInt()
+                w.updateViewLayout(r, p)
+            }
+            true
+        }
+
+        bMin.setOnClickListener {
+            if (bd.visibility == View.VISIBLE) {
+                bd.visibility = View.GONE
+                bMin.text = "+"
+            } else {
+                bd.visibility = View.VISIBLE
+                bMin.text = "-"
+            }
+            w.updateViewLayout(r, p)
+        }
+        bClose.setOnClickListener { stopSelf() }
+        bAnalyze.setOnClickListener { scanHandler?.post { engine?.analyzeNow() } }
+        bSync.setOnClickListener { scanHandler?.post { engine?.syncNow() } }
+        bTf.setOnClickListener { scanHandler?.post { engine?.cycleTf() } }
+        bLead.setOnClickListener { scanHandler?.post { engine?.cycleLead() } }
+        bStats.setOnClickListener {
+            statsOn = !statsOn
+            w.updateViewLayout(r, p)
+        }
+        bReset.setOnClickListener { scanHandler?.post { engine?.resetStats() } }
+
+        w.addView(r, p)
+    }
+
+    private val poll = object : Runnable {
+        override fun run() {
+            val e = engine
+            if (e != null) {
+                tvCd?.text = e.countdown
+                tvSig?.text = e.sigText
+                val kind = e.sigKind
+                tvSig?.setBackgroundColor(Color.parseColor(if (kind == 1) "#14532d" else if (kind == 2) "#7f1d1d" else "#1e293b"))
+                tvSig?.setTextColor(Color.parseColor(if (kind == 1) "#bbf7d0" else if (kind == 2) "#fecaca" else "#94a3b8"))
+                tvSub?.text = e.sub
+                tvLive?.text = e.live + "\n" + e.syncNote
+                btnTf?.text = "TF " + e.tfSec + "s"
+                btnLead?.text = "Lead " + e.leadSec + "s"
+                val st = tvStats
+                if (st != null) {
+                    if (statsOn) {
+                        st.visibility = View.VISIBLE
+                        st.text = e.statsText
+                    } else {
+                        st.visibility = View.GONE
+                    }
+                }
+            }
+            val r = root
+            if (r != null) {
+                val loc = IntArray(2)
+                r.getLocationOnScreen(loc)
+                mask = intArrayOf(loc[0], loc[1], loc[0] + r.width, loc[1] + r.height)
+            }
+            ui.postDelayed(this, 250)
+        }
+    }
+
+    private fun alertUser() {
+        try {
+            val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            v.vibrate(VibrationEffect.createOneShot(350, VibrationEffect.DEFAULT_AMPLITUDE))
+        } catch (e: Throwable) {
+        }
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP, 250)
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun startEngine() {
+        val t = HandlerThread("bpc-scan")
+        t.start()
+        scanThread = t
+        val h = Handler(t.looper)
+        scanHandler = h
+        val e = Engine(
+            { grab() },
+            { mask },
+            getSharedPreferences("bpc", Context.MODE_PRIVATE),
+            { ui.post { alertUser() } }
+        )
+        engine = e
+        h.post(object : Runnable {
+            override fun run() {
+                try {
+                    e.step()
+                } catch (ex: Throwable) {
+                    e.live = "Error: " + ex.message
+                }
+                h.postDelayed(this, 300)
+            }
+        })
+        ui.post(poll)
+    }
+
+    override fun onDestroy() {
+        ui.removeCallbacks(poll)
+        scanHandler?.removeCallbacksAndMessages(null)
+        scanThread?.quitSafely()
+        try {
+            val r = root
+            if (r != null) wm?.removeView(r)
+        } catch (e: Throwable) {
+        }
+        try { vdisplay?.release() } catch (e: Throwable) { }
+        try { reader?.close() } catch (e: Throwable) { }
+        try { projection?.stop() } catch (e: Throwable) { }
+        running = false
+        super.onDestroy()
+    }
+}
+
+======================================================================
+FILE: app/src/main/java/com/example/bpchecker/MainActivity.kt
+======================================================================
+package com.example.bpchecker
+
+import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.provider.Settings
+import android.view.ViewGroup
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+
+class MainActivity : Activity() {
+
+    private val reqCapture = 1001
+    private val reqNotif = 1002
+    private var askedNotif = false
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val scroll = ScrollView(this)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(18), dp(24), dp(18), dp(24))
+        scroll.addView(col, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val title = TextView(this)
+        title.text = "BP Checker"
+        title.textSize = 26f
+        col.addView(title)
+
+        val info = TextView(this)
+        info.textSize = 15f
+        info.setPadding(0, dp(10), 0, dp(14))
+        info.text = "Floating chart analyzer for a DEMO account (learning only).\n\n" +
+            "1. Allow 'display over other apps'.\n" +
+            "2. Press Start and accept the screen-capture question.\n" +
+            "3. Open the Quotex app. A small panel floats on top. Drag it by its title to a place that does not cover the candles.\n\n" +
+            "The panel finds the candles, support/resistance and the candle timing by itself, shows UP or DOWN a few seconds before each new candle, and scores every signal on the next candle.\n\n" +
+            "Keep the phone in one orientation while it runs. Zoom the Quotex chart in so candles are wide."
+        col.addView(info)
+
+        val b1 = Button(this)
+        b1.text = "1. Allow display over other apps"
+        b1.setOnClickListener {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + packageName)))
+        }
+        col.addView(b1)
+
+        val b2 = Button(this)
+        b2.text = "2. Start floating analyzer"
+        b2.setOnClickListener { startFlow() }
+        col.addView(b2)
+
+        val b3 = Button(this)
+        b3.text = "Stop analyzer"
+        b3.setOnClickListener {
+            stopService(Intent(this, OverlayService::class.java))
+            Toast.makeText(this, "Stopped", Toast.LENGTH_SHORT).show()
+        }
+        col.addView(b3)
+
+        setContentView(scroll)
+    }
+
+    private fun startFlow() {
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "Press button 1 first and allow 'display over other apps'.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 33 && !askedNotif &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            askedNotif = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), reqNotif)
+            return
+        }
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        startActivityForResult(mpm.createScreenCaptureIntent(), reqCapture)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == reqNotif) startFlow()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == reqCapture) {
+            if (resultCode == RESULT_OK && data != null) {
+                val i = Intent(this, OverlayService::class.java)
+                i.putExtra("code", resultCode)
+                i.putExtra("data", data)
+                startForegroundService(i)
+                Toast.makeText(this, "Started. Now open the Quotex app.", Toast.LENGTH_LONG).show()
+                finish()
+            } else {
+                Toast.makeText(this, "Screen capture was not allowed.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+}
